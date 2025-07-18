@@ -7,7 +7,7 @@ from telebot import TeleBot, types
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # --- Configurations ---
-TOKEN = os.getenv('TELEGRAM_TOKEN', 'your_token')
+TOKEN = os.getenv('TELEGRAM_TOKEN', '*')
 DATA_FILE = 'data.json'
 DEFAULT_REMINDER_TIME = {'hour': 20, 'minute': 0}
 TIMEZONE = 'Europe/Kyiv'
@@ -77,7 +77,7 @@ def generate_schedule(year, month, users):
 
 
 def format_schedule(schedule, users, year, month):
-    lines = [f"Розклад на {MONTHS_UK[month]} {year}"]
+    lines = [f"Розклад на {MONTHS_UK[month]} {year}\n"]
     for iso, uid in sorted(schedule.items()):
         dt = datetime.fromisoformat(iso)
         day = DAYS_UK[dt.strftime('%A')]
@@ -215,12 +215,154 @@ def process_reminder_time(msg):
 
 @bot.message_handler(func=lambda m: m.text == 'Помінятись')
 def cmd_ex(msg):
-    data = load_data(); uid = str(msg.chat.id)
-    if uid not in data.get('schedule_current', {}).values():
-        bot.send_message(msg.chat.id, "Спочатку згенеруйте розклад.", reply_markup=build_main_menu())
+    uid = str(msg.chat.id)
+    data = load_data()
+    data['users'].setdefault(uid, {})['ex_temp'] = {}  # скидання попередніх даних
+    save_data(data)
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("📅 Поточний місяць", callback_data='ex_month_current'),
+        types.InlineKeyboardButton("📅 Наступний місяць", callback_data='ex_month_next')
+    )
+    bot.send_message(msg.chat.id, "Оберіть місяць для обміну чергуванням:", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('ex_month_'))
+def handle_month_selection(c):
+    uid = str(c.from_user.id)
+    month_key = c.data.split('_')[2]
+    data = load_data()
+    data['users'][uid]['ex_temp'] = {'month_key': month_key}
+    save_data(data)
+
+    sched = data.get(f'schedule_{month_key}', {})
+    user_dates = [d for d, u in sched.items() if u == uid]
+    if not user_dates:
+        bot.answer_callback_query(c.id)
+        bot.send_message(uid, "У вас немає чергувань у цьому місяці.")
         return
-    sent = bot.send_message(msg.chat.id, "Введіть вашу дату (dd.mm):")
-    bot.register_next_step_handler(sent, process_exchange_from)
+
+    kb = types.InlineKeyboardMarkup()
+    for d in user_dates:
+        d_obj = datetime.fromisoformat(d)
+        label = d_obj.strftime('%d.%m')
+        kb.add(types.InlineKeyboardButton(label, callback_data=f'ex_mydate_{d}'))
+
+    #kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data='ex_restart'))
+    bot.edit_message_text("Оберіть своє чергування:", uid, c.message.message_id, reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('ex_mydate_'))
+def handle_mydate_selection(c):
+    uid = str(c.from_user.id)
+    selected_date = c.data.replace('ex_mydate_', '')
+    data = load_data()
+    data['users'][uid]['ex_temp']['from'] = selected_date
+    save_data(data)
+
+    sched = data.get(f"schedule_{data['users'][uid]['ex_temp']['month_key']}", {})
+    available_uids = set(sched.values()) - {uid}
+
+    kb = types.InlineKeyboardMarkup()
+    for other_uid in available_uids:
+        user_info = data['users'].get(other_uid, {})
+        name = f"{user_info.get('emoji', '')} {user_info.get('name', f'UID {other_uid}')}"
+
+        kb.add(types.InlineKeyboardButton(name, callback_data=f'ex_user_{other_uid}'))
+
+    #kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data='ex_month_back'))
+    bot.edit_message_text("Оберіть колегу для обміну:", uid, c.message.message_id, reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('ex_user_'))
+def handle_colleague_selection(c):
+    uid = str(c.from_user.id)
+    target_uid = c.data.replace('ex_user_', '')
+    data = load_data()
+
+    sched = data.get(f"schedule_{data['users'][uid]['ex_temp']['month_key']}", {})
+    target_dates = [d for d, u in sched.items() if u == target_uid]
+
+    if not target_dates:
+        bot.answer_callback_query(c.id)
+        bot.send_message(uid, "У цього колеги немає чергувань у цьому місяці.")
+        return
+
+    data['users'][uid]['ex_temp']['target'] = target_uid
+    save_data(data)
+
+    kb = types.InlineKeyboardMarkup()
+    for d in target_dates:
+        d_obj = datetime.fromisoformat(d)
+        label = d_obj.strftime('%d.%m')
+        kb.add(types.InlineKeyboardButton(label, callback_data=f'ex_targetdate_{d}'))
+
+   # kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data='ex_user_back'))
+    bot.edit_message_text("Оберіть дату чергування колеги:", uid, c.message.message_id, reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith('ex_targetdate_'))
+def handle_target_date_selection(c):
+    uid = str(c.from_user.id)
+    to_date = c.data.replace('ex_targetdate_', '')
+    data = load_data()
+    ex = data['users'][uid].pop('ex_temp', {})
+    from_date = ex['from']
+    target_uid = ex['target']
+
+    exchange_requests[uid] = {'from': from_date, 'to': to_date, 'target': target_uid}
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("✅ Так", callback_data=f"ex_yes_{uid}"),
+        types.InlineKeyboardButton("❌ Ні", callback_data=f"ex_no_{uid}")
+    )
+
+    bot.send_message(
+        int(target_uid),
+        f"{data['users'][uid]['name']} пропонує обмін:\n"
+        f"🔁 Ваше чергування {to_date[8:]}.{to_date[5:7]} "
+        f"↔ його(її) {from_date[8:]}.{from_date[5:7]}\nПогоджуєтесь?",
+        reply_markup=kb
+    )
+    bot.send_message(uid, "Запит надіслано колезі.")
+
+@bot.callback_query_handler(func=lambda c: c.data == 'ex_restart')
+def handle_restart(c):
+    uid = str(c.from_user.id)
+    data = load_data()
+    data['users'][uid]['ex_temp'] = {}
+    save_data(data)
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(
+        types.InlineKeyboardButton("📅 Поточний місяць", callback_data='ex_month_current'),
+        types.InlineKeyboardButton("📅 Наступний місяць", callback_data='ex_month_next')
+    )
+    bot.edit_message_text("Оберіть місяць для обміну чергуванням:", uid, c.message.message_id, reply_markup=kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == 'ex_month_back')
+def handle_back_to_month(c):
+    return handle_restart(c)
+
+@bot.callback_query_handler(func=lambda c: c.data == 'ex_user_back')
+def handle_back_to_user_dates(c):
+    uid = str(c.from_user.id)
+    data = load_data()
+    ex_temp = data['users'][uid].get('ex_temp', {})
+    from_date = ex_temp.get('from')
+    if not from_date:
+        return handle_restart(c)
+
+    sched = data.get(f"schedule_{ex_temp['month_key']}", {})
+    available_uids = set(sched.values()) - {uid}
+    kb = types.InlineKeyboardMarkup()
+    for other_uid in available_uids:
+        name = data['users'].get(other_uid, {}).get('name', f"UID {other_uid}")
+        kb.add(types.InlineKeyboardButton(name, callback_data=f'ex_user_{other_uid}'))
+    #kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data='ex_month_back'))
+
+    bot.edit_message_text("Оберіть колегу для обміну:", uid, c.message.message_id, reply_markup=kb)
+
+
 
 def process_exchange_from(msg):
     if msg.text == 'Скасувати': return cmd_cancel(msg)
@@ -286,20 +428,30 @@ def process_exchange_to(msg):
 def handle_exchange_callback(c):
     _, action, uid = c.data.split('_')
     req = exchange_requests.pop(uid, None)
+
     if not req:
         bot.answer_callback_query(c.id, "Запит не знайдено.")
         return
-    data = load_data(); sched = data['schedule_current']
+
+    data = load_data()
+    sched = data.get('schedule_current', {})
+    data['schedule_current'] = sched  # гарантія оновлення
+
     fr, to_dt, tgt = req['from'], req['to'], req['target']
+
     if action == 'yes':
+        # Обмін місцями
         sched[fr], sched[to_dt] = tgt, uid
-        save_data(data)
-        bot.send_message(int(uid), "Обмін підтверджено!")
-        bot.send_message(int(tgt), "Ви підтвердили.")
+
+        save_data(data)  # обов’язкове збереження після оновлення
+        bot.send_message(int(uid), f"✅ Обмін підтверджено! Ваш новий день чергування: {to_dt[8:]}")
+        bot.send_message(int(tgt), f"✅ Ви погодились на обмін. Ваш новий день чергування: {fr[8:]}")
     else:
-        bot.send_message(int(uid), "Колега відхилив.")
-        bot.send_message(int(tgt), "Запит відхилено.")
+        bot.send_message(int(uid), "❌ Колега відхилив обмін.")
+        bot.send_message(int(tgt), "Ви відхилили запит на обмін.")
+
     bot.answer_callback_query(c.id)
+
 
 if __name__ == '__main__':
     bot.infinity_polling()
