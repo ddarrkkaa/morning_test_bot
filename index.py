@@ -7,7 +7,7 @@ from telebot import TeleBot, types
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # --- Configurations ---
-TOKEN = os.getenv('TELEGRAM_TOKEN', '*')
+TOKEN = os.getenv('TELEGRAM_TOKEN', '***')
 DATA_FILE = 'data.json'
 DEFAULT_REMINDER_TIME = {'hour': 20, 'minute': 0}
 TIMEZONE = 'Europe/Kyiv'
@@ -454,4 +454,4 @@ def handle_exchange_callback(c):
 
 
 if __name__ == '__main__':
-    bot.infinity_polling()
+    bot.infinity_polling(none_stop=True)
